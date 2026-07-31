@@ -1,0 +1,171 @@
+# ============================================================
+# 全局配置
+# ============================================================
+
+paths:
+  # 研报归档根目录（相对本文件所在项目根目录，或写绝对路径）
+  data_dir: "./data"
+  # Playwright 浏览器 profile 目录。cf_clearance cookie 存在这里，
+  # 首次 headful 通过 Cloudflare 挑战后可长期复用，不要删。
+  browser_profile: "./.browser-profile"
+  db: "./data/reports.db"
+
+browser:
+  # 首次运行必须 false（headful），让 Cloudflare 挑战自然通过。
+  # 挑战通过、profile 里有了 cf_clearance 之后可以试着改成 true。
+  # 注意：headless 更容易被识别，如果改 true 后开始出 403，改回 false。
+  headless: false
+
+  # 用哪个浏览器内核。留空 = 用 Playwright 自带的 Chromium
+  # （需要先跑 `playwright install chromium`，要从官方 CDN 下 ~150MB）。
+  #
+  # 国内网络下不动那 150MB 时，改成 "chrome" 直接用系统已装的 Chrome，
+  # 完全跳过下载。可选值：chrome / msedge / chrome-beta / 空
+  #
+  # 附带好处：真实 Chrome 的指纹比 Playwright Chromium 更"正常"，
+  # 过 Cloudflare 挑战反而更顺。
+  channel: "chrome"
+
+  # 指定浏览器可执行文件的绝对路径。设了这个就忽略 channel。
+  # 一般不用填，除非 Chrome 装在非默认位置。
+  # macOS 默认位置：
+  #   /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+  executable_path: ""
+  # 页面加载超时（毫秒）
+  timeout_ms: 45000
+
+  # 页面加载的等待条件：domcontentloaded / load / networkidle
+  #
+  # 必须用 domcontentloaded，不要用 networkidle。
+  # 原因：这个站挂了 Datadog RUM 和 LaunchDarkly，会持续发埋点请求
+  # （rum?ddsource=... / logs?ddsource=...），网络永远不会空闲，
+  # networkidle 条件一直不满足，必然 60 秒超时。
+  # 而研报列表是服务端直出的静态 HTML，DOM 一就绪内容就全在了。
+  wait_until: "domcontentloaded"
+
+  # DOM 就绪后再等关键元素出现的超时（毫秒）。
+  # 具体等哪个选择器由站点配置里的 ready_selector 指定。
+  ready_timeout_ms: 20000
+
+  # 额外静置时间（毫秒），给前端渲染留余量
+  settle_ms: 2000
+  locale: "en-US"
+  # 留空则用 Playwright 自带的 Chromium UA（推荐，避免 UA 与指纹不一致被识别）
+  user_agent: ""
+
+fetch:
+  # 保守限速。Cloudflare 对高频访问会升级到硬验证码，
+  # 一旦触发只能人工过一次，不要为了快把这两个值调小。
+  min_interval_sec: 6.0
+  jitter_sec: 3.0
+  max_retries: 3
+  retry_backoff_sec: 15
+  # 单次运行最多抓取多少篇，防止误操作打爆
+  max_reports_per_run: 60
+  # 同一篇连续失败多少次后跳过，避免卡在坏条目上空转。
+  # 用 --retry-failed 或 `python -m gsr retry` 可以重新放开。
+  max_fail_retries: 3
+  # 是否下载 PDF 原文归档
+  download_pdf: true
+  # 是否保存原始 HTML（翻译用的正文来源，建议保留）
+  save_raw_html: true
+
+translate:
+  enabled: true
+  # 使用哪个 provider，见 providers 下的 key
+  provider: "modelscope"
+  target_lang: "简体中文"
+  # 每个分块的目标字符数。太大容易掉内容，太小上下文断裂。
+  chunk_chars: 4000
+  # 分块之间重叠的字符数，帮助模型衔接上下文
+  chunk_overlap: 200
+  # 并发翻译的分块数。API 限流严的话调成 1。
+  concurrency: 2
+  # 分块级缓存。每块译完立刻落盘到 <输出文件>.parts.json，
+  # 中途失败时已译好的块不作废，重试只补失败的那些。整篇成功后自动删除。
+  # 一篇 35 页研报要切 25 块，没这个的话第 6 块失败就白烧前 5 块的 token。
+  cache_blocks: true
+  glossary_file: "./config/glossary.json"
+  # 译文里是否保留原文的图表占位标记
+  keep_figure_placeholders: true
+
+  # ------------------------------------------------------------------
+  # use_system_proxy 说明（重要，国内环境必看）
+  #
+  #   true  = 沿用环境变量里的代理（HTTPS_PROXY / ALL_PROXY 等）
+  #   false = 直连，忽略所有代理环境变量
+  #
+  # 境外 API（Claude / OpenAI）需要代理 -> true
+  # 国内 API（魔搭 / DeepSeek / 通义 / 智谱）不该走代理 -> false
+  #   走境外代理不仅慢，还常因代理协议不支持而直接报错，
+  #   比如挂了 SOCKS 代理但没装 socksio 就会失败。
+  # ------------------------------------------------------------------
+  providers:
+    claude:
+      kind: "anthropic"
+      base_url: "https://api.anthropic.com/v1/messages"
+      model: "claude-sonnet-5"
+      api_key_env: "ANTHROPIC_API_KEY"
+      max_tokens: 8192
+      temperature: 0.2
+      use_system_proxy: true      # 境外，需要代理
+
+    openai:
+      kind: "openai"
+      base_url: "https://api.openai.com/v1/chat/completions"
+      model: "gpt-4o"
+      api_key_env: "OPENAI_API_KEY"
+      max_tokens: 8192
+      temperature: 0.2
+      use_system_proxy: true      # 境外，需要代理
+
+    deepseek:
+      kind: "openai"          # DeepSeek 兼容 OpenAI 协议，复用同一实现
+      base_url: "https://api.deepseek.com/v1/chat/completions"
+      model: "deepseek-chat"
+      api_key_env: "DEEPSEEK_API_KEY"
+      max_tokens: 8192
+      temperature: 0.2
+      use_system_proxy: false     # 国内，直连
+
+    qwen:
+      kind: "openai"
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+      model: "qwen-plus"
+      api_key_env: "DASHSCOPE_API_KEY"
+      max_tokens: 8192
+      temperature: 0.2
+      use_system_proxy: false     # 国内，直连
+
+    zhipu:
+      kind: "openai"
+      base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+      model: "glm-4-plus"
+      api_key_env: "ZHIPU_API_KEY"
+      max_tokens: 8192
+      temperature: 0.2
+      use_system_proxy: false     # 国内，直连
+
+    # 魔搭 ModelScope API-Inference（OpenAI 兼容）
+    # 注意：官网示例给的 base_url 是 https://api-inference.modelscope.cn/v1，
+    # 那是 SDK 用的根地址。这里要写完整端点，所以补上 /chat/completions。
+    # model 用 ModelScope 的 Model-Id 全称（含组织名前缀）。
+    # token 在魔搭「首页 → 访问令牌」里拿，形如 ms-xxxxxxxx。
+    # 免费额度有每日调用上限，翻译长研报建议把 translate.concurrency 设为 1。
+    modelscope:
+      kind: "openai"
+      base_url: "https://api-inference.modelscope.cn/v1/chat/completions"
+      model: "Qwen/Qwen3.5-397B-A17B"    # Qwen/Qwen3-8B    Qwen/Qwen3.5-397B-A17B
+      api_key_env: "MODELSCOPE_API_KEY"
+      max_tokens: 8192
+      temperature: 0.2
+      use_system_proxy: false     # 国内，直连（走代理会失败）
+      # 免费额度限流紧，实测并发 2 会让服务端返回空信封
+      # （HTTP 200 但 choices=null、usage 全 0）。设 1 最稳。
+      concurrency: 1
+      # 遇到空信封时的退避重试次数
+      response_retries: 4
+
+# 启用哪些站点源（对应 config/sources/*.yaml）
+sources:
+  - goldman

@@ -1,0 +1,267 @@
+# ============================================================
+# 高盛研报站点配置
+#
+# 已实测确认（2026-07）：
+#   - 列表页 /content/public.html 是静态 HTML，研报条目直接嵌在首屏文档里，
+#     不存在需要单独调用的列表 API。页面里另有一份内嵌 JSON（含
+#     distributionHeadline 等字段），比 DOM 更结构化，优先解析。
+#   - 研报详情页 .html 是静态正文，可直接提取文本用于翻译，无需解析 PDF。
+#   - 同一份研报同时提供 .html 和 .pdf 两种形式，UUID 相同。
+#   - 全站有 Cloudflare managed challenge，纯 HTTP 请求（requests/httpx）
+#     一律 403，必须走真实浏览器上下文。
+# ============================================================
+
+name: goldman
+display_name: "Goldman Sachs Research"
+
+entry_url: "https://www.gspublishing.com/content/public.html"
+base_url: "https://www.gspublishing.com"
+
+# 研报链接的 URL 形态：/content/research/en/reports/YYYY/MM/DD/<uuid>.html
+# 这条正则同时用于兜底解析和从 URL 反推日期与 ID，是整个 adapter 最稳的锚点。
+report_url_pattern: '/content/research/(?P<lang>[a-z]{2})/reports/(?P<year>\d{4})/(?P<month>\d{2})/(?P<day>\d{2})/(?P<uuid>[0-9a-fA-F-]{36})\.(?P<ext>html|pdf)'
+
+# "内容已就绪"的判据。也用于判断"等待条件超时但页面其实已可用"的情况
+# —— 这个站有持续的 Datadog/LaunchDarkly 埋点请求，任何等网络安静的
+# 条件都会超时。
+#
+# 两个页面结构不同，两个选择器都列上（逗号 = 任一命中即可）：
+#   query-list-container      → public.html
+#   SearchResults__headline   → search.html
+ready_selector: '[data-testid="query-list-container"], a.SearchResults__headline'
+
+# 详情页的就绪判据。正文容器命名可能不同，用较宽松的 article/main 兜底。
+detail_ready_selector: 'article, main, [data-testid="report-body"]'
+
+# ---- 解析策略：按顺序尝试，前一个拿到结果就不再往下走 ----
+parse_strategies:
+  - embedded_json   # public.html：扫 <script> 里含 distributionHeadline 的 JSON
+  - search_table    # search.html：表格布局，class 名语义化且元数据最全
+  - dom_testid      # public.html：按 data-testid 定位
+  - href_regex      # 全文正则扒 report_url_pattern，最粗暴但最不会失效
+
+# ---- search.html 的表格结构（2026-07 实测）----
+# 这一页和 public.html 完全不同：表格布局，且 class 名是语义化的
+# SearchResults__xxx（BEM 风格），不是 public.html 上那种编译 hash
+# （gs-uitk-c-hf7351），所以按 class 定位在这里是安全的。
+#
+# 一行的构造：
+#   <tr>
+#     <td class="SearchResults__colCheckbox">
+#     <td class="SearchResults__colDate">
+#        <div class="SearchResults__hiddenEl">1783699236000</div>  ← 原始毫秒时间戳
+#        <span>11 Jul 2026</span><span>12:00am</span>              ← 本地时区展示，不用
+#     <td class="SearchResults__colCopy">
+#        <a class="SearchResults__headline" href="绝对URL"><span>标题</span></a>
+#        <div class="SearchResults__metaText">Research | Portfolio Strategy -  作者A,  作者B, and others…</div>
+#        <span class="SearchResults__colExtract">摘要摘录…</span>   ← public.html 没有这个
+#     <td class="SearchResults__colPages">35</td>
+#   </tr>
+search_dom_selectors:
+  headline:       "a.SearchResults__headline"
+  timestamp:      ".SearchResults__hiddenEl"
+  meta_text:      ".SearchResults__metaText"
+  extract:        ".SearchResults__colExtract"
+  pages_cell:     "td.SearchResults__colPages"
+  # 用于读取结果总数与总页数，仅作日志和翻页上限，不影响解析
+  result_summary: ".SearchResults__resultSummary"
+  pager:          ".SearchResults__pagerContainer"
+
+# metaText 的拆分规则：" - " 之前是「板块 | 分类」，之后是作者列表
+meta_text_split: " - "
+authors_tail_markers:
+  - "and others…"
+  - "and others"
+
+# 内嵌 JSON 的字段名。前几个是 2026-07 实测确认的真实字段名，
+# 后面的是备选（改版后字段改名时按序回退）。
+#
+# 实测的真实对象长这样：
+#   {
+#     "distributionHeadline": "Global Strategy Paper: Balancing Innovation...",
+#     "path": "/content/research/en/reports/2026/07/10/ce510cb7-....html",
+#     "totalPages": 35,
+#     "leadAuthor": "Christian Mueller-Glissmann, CFA",
+#     "hasMultipleAuthors": true,
+#     "sourceDisplayName": "Research | Portfolio Strategy",
+#     "publicationDateTime": 1783699236000,
+#     "reportTypes": ["6dd1e227-..."],
+#     "restrictionDetails": null,
+#     "securityRestrictionMap": null
+#   }
+# 注意没有 summary 字段 —— 列表页不提供摘要，只能从详情页正文取。
+json_field_map:
+  title:      ["distributionHeadline", "headline", "title", "documentTitle"]
+  url:        ["path", "documentUrl", "url", "href", "link", "pdfUrl"]
+  date:       ["publicationDateTime", "publishDate", "publicationDate", "date"]
+  summary:    ["summary", "abstract", "synopsis", "description"]
+  category:   ["sourceDisplayName", "category", "researchCategory", "topic"]
+  authors:    ["leadAuthor", "authors", "analysts", "contributors"]
+  page_count: ["totalPages", "pageCount", "pages"]
+  # 非 null 说明该研报有访问限制，标记出来便于排查抓取失败
+  restriction: ["restrictionDetails", "securityRestrictionMap"]
+
+# leadAuthor 只给主笔，hasMultipleAuthors 为 true 时补后缀
+multi_author_flag: "hasMultipleAuthors"
+multi_author_suffix: " 等"
+
+# sourceDisplayName 形如 "Research | Portfolio Strategy"，取分隔符后半段作分类
+category_split: " | "
+category_take_last: true
+
+# DOM 策略用的选择器（全部基于 data-testid，实测存在）
+dom_selectors:
+  item_container: '[data-testid="query-list-item-container"]'
+  list_container: '[data-testid="query-list-container"]'
+  item_content:   '[data-testid="search-item-content"]'
+  title_anchor:   '#search-item-title a, [id="search-item-title"] a'
+  metadata:       '[data-testid="search-item-metadata"]'
+
+# ---- 日期来源优先级（重要）----
+# 实测发现：列表页展示的日期是按浏览器本地时区渲染的，会和研报实际发布日期
+# 差一天。例：publicationDateTime = 1783699236000 = 2026-07-10 16:00 UTC
+#            = 2026-07-10 12:00 ET（发布时点）
+#            = 2026-07-11 00:00 UTC+8（中国时区下页面显示 "11 Jul 2026 | 12:00am"）
+# 而 URL 路径写的是 /2026/07/10/ —— 与发布日一致。
+#
+# 所以：URL 路径日期是唯一权威来源，展示文本一律不用。
+date_source_priority:
+  - "url_path"            # /reports/YYYY/MM/DD/ —— 权威
+  - "json_timestamp"      # publicationDateTime，按 UTC 解析，与 URL 一致
+  # - "display_text"       # 受时区影响，故意不启用
+
+# ---- 分页 ----
+# 实测确认：public.html 首屏只有 10 条，且页面里没有"加载更多"按钮。
+# 但列表页内嵌了一个搜索页链接，带 page= 参数 —— 这就是翻页入口，
+# 比滚动加载可靠得多。query_template 是从 public.html 里原样抄来的
+# 查询串（保持原编码不动），只把 page 参数化。
+#
+# 各参数含义：
+#   facets   = id_curated CONTAINS_ALL [...]  公开精选集合的 ID
+#   filter   = 限定 source、排除若干 report_types 和 publications、
+#              totalPages IN [1,99999]
+#   sort     = time（按时间降序）
+#   language = ["en"]
+# 实测（2026-07）：search.html 每页 25 条，翻页确认可用。
+# 第 1 页覆盖约 5 个月（2026-07-10 ~ 2026-02-11），第 2 页翻到 2025-08。
+# 所以抓"今年以来"只需 2 页，早停会在第 2 页触发。
+#
+# 已知差异：search.html 的 DOM 结构与 public.html 不同，
+# embedded_json 和 dom_testid 两级在此页都空转，实际靠 href_regex 兜底。
+# 待补 search.html 专用的选择器和字段探针以恢复元数据。
+pagination:
+  mode: "page_param"
+  search_url: "https://www.gspublishing.com/content/research/site/search.html"
+  query_template: 'facets=%28id_curated+CONTAINS_ALL+%5B%22693d9ad0-1496-446e-a71b-692a38cd1232%22%5D%29&limitTo=%5B%22%22%5D&filter=%28sources+EQ+%24%7B%28%22e3c3ad77-fd99-4f30-8614-66e8870877c9%22%29%7D%24+AND+NOT+report_types+EQ+%24%7B%28%227087b059-f9e7-418c-ab7f-5b241a382d79%22%29+OR+%28%22cb9e77ee-da04-4348-86ea-49e43af7d528%22%29%7D%24+AND+NOT+publications+EQ+%24%7B%28%228d85c012-4444-4012-be75-5aaf3269ede6%22%29+OR+%28%227b9e2ff1-f7f8-430a-808e-5a24048dbe35%22%29+OR+%28%22cd4cd722-d964-469e-ae29-083744706135%22%29+OR+%28%22e81ff6da-ac0c-40e4-8554-241c8f27733a%22%29%7D%24+AND+totalPages+IN+%5B1%2C99999%5D%29&page={page}&sort=time&language=%5B%22en%22%5D'
+  start_page: 1
+  max_pages: 40
+  # sort=time 是降序，所以一旦某页里最旧的条目已早于 --since，
+  # 后面的页只会更旧，直接停止翻页。抓"今年以来"时能省掉大量无用请求。
+  early_stop_on_date: true
+  # 某页解析不出任何条目就认为到底了
+  stop_on_empty_page: true
+  # page_param 万一失效（改版），回退到在 entry_url 上滚动加载
+  fallback_mode: "scroll"
+  max_scrolls: 25
+  scroll_wait_ms: 1800
+  stop_after_stale_rounds: 3
+
+# ---- 正文提取 ----
+# 详情页里正文的候选容器，按顺序尝试；都不中就退化为整页文本清洗。
+content_selectors:
+  - '[data-testid="report-body"]'
+  - "article"
+  - "main"
+  - ".report-content"
+
+# 提取正文时直接剔除的噪音节点。
+#
+# HTML 版是个阅读器界面，带一整套交互控件：章节目录、PDF/分享按钮、
+# 字号菜单、音频朗读播放器、图标字体。这些都不在 nav/footer 里，
+# 只删那几个标签清不掉，会原样进到译文里（模型会一本正经地把
+# "Font Size"、"Listen to report" 翻成中文）。
+#
+# 下面这些选择器基于实测存在的属性，不是猜的 class 名：
+#   data-gs-uitk-component="icon" —— 图标字体，产出 ×、▼、check 这类字形
+#   role="img"                    —— 同上
+strip_selectors:
+  - "script"
+  - "style"
+  - "nav"
+  - "footer"
+  - "header"
+  - "noscript"
+  - '[data-testid="disclosure"]'
+  # 交互控件
+  - "button"
+  - "select"
+  - "option"
+  - "input"
+  - "textarea"
+  - "audio"
+  - "video"
+  - "svg"
+  - "iframe"
+  # 图标字体（会变成 × ▼ {} check 之类的字形）
+  - '[data-gs-uitk-component="icon"]'
+  - '[role="img"]'
+  - '[aria-hidden="true"]'
+  # 工具栏 / 目录 / 分享 / 字号 / 播放器（按 class 子串匹配，i = 忽略大小写）
+  - '[role="toolbar"]'
+  - '[class*="toolbar" i]'
+  - '[class*="tableOfContents" i]'
+  - '[class*="tableofcontents" i]'
+  - '[class*="share" i]'
+  - '[class*="fontSize" i]'
+  - '[class*="fontsize" i]'
+  - '[class*="audioPlayer" i]'
+  - '[class*="audioplayer" i]'
+  - '[class*="listenTo" i]'
+
+# ---- 文本层兜底清理 ----
+# 上面按节点剔除之后仍可能有残留（有些控件文字并不在独立节点里）。
+# 这一层按文本规则再清一遍，规则保守，只删明确是界面元素的行。
+reader_chrome:
+  enabled: true
+  # 整行完全等于这些文字（忽略大小写和首尾空白）就删掉
+  drop_exact_lines:
+    - "Table of Contents"
+    - "More"
+    - "Font Size"
+    - "Listen to report"
+    - "Download Email Summary"
+    - "Email Summary"
+    - "Share"
+    - "PDF"
+    - "Print"
+    - "Save"
+    - "Add to Reading List"
+    - "{}"
+    - "×"
+    - "✕"
+    - "▼"
+    - "▲"
+    - "check"
+  # 只含一个链接、且链接目标匹配这些前缀/后缀的行 —— 都是按钮或目录项
+  drop_link_only_targets:
+    prefixes: ["mailto:", "#chapter", "#author-list", "#", "javascript:"]
+    suffixes: [".pdf"]
+  # 报头那行元信息（"28 June 2026 | 7:06PM EDT | Research | Commodities | By …"）
+  # 这些字段 front matter 里都有，正文里重复且会被翻译
+  drop_line_patterns:
+    - '^\d{1,2}\s+\w+\s+\d{4}\s*\|'          # 日期开头且带竖线分隔
+    - '^\d{1,2}:\d{2}\s*/\s*\d{1,2}:\d{2}$'  # 音频进度 0:00/12:39
+    - '^\[[^\]]*\]\(mailto:'                 # mailto 分享链接（可能很长）
+  # 删完后如果某一行只剩标点/空白，也一并去掉
+  drop_punctuation_only: true
+
+# 免责声明/监管披露章节的起始标记。这些内容占篇幅大、法律文本翻译无价值，
+# 默认从正文里截断掉（想保留就把 truncate_at_disclaimer 设 false）。
+truncate_at_disclaimer: true
+disclaimer_markers:
+  - "Disclosure Appendix"
+  - "Regulatory Disclosures"
+  - "Reg AC"
+  - "Analyst Certification"
+  - "Distribution of ratings"
+  - "General Disclosures"

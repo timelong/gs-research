@@ -1,0 +1,12 @@
+# 只装 Python 包，不含浏览器内核。
+# 默认配置用系统已装的 Chrome（browser.channel: "chrome"），无需下载内核。
+# 想用 Playwright 自带内核再跑 `playwright install chromium`。
+playwright>=1.44
+beautifulsoup4>=4.12
+lxml>=5.2
+PyYAML>=6.0
+# [socks] 是为了兼容环境里挂了 SOCKS 代理的情况（访问境外 API 时需要）。
+# 国内 API 建议在 config.yaml 里设 use_system_proxy: false 直连，不依赖这个。
+httpx[socks]>=0.27
+markdownify>=0.12
+python-dateutil>=2.9
